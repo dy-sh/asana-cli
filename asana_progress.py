@@ -10,6 +10,8 @@ import os
 import sys
 from typing import List, Dict, Any
 import asana
+import keyring
+import getpass
 from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn
 from rich.table import Table
@@ -22,19 +24,13 @@ class AsanaProgressTracker:
         Initialize the Asana progress tracker.
         
         Args:
-            api_key (str): Asana API key. If None, will try to get from environment variable.
+            api_key (str): Asana API key. If None, will try to get from keychain or prompt user.
         """
         self.console = Console()
         
-        # Get API key from parameter or environment variable
+        # Get API key from parameter, keychain, or prompt user
         if api_key is None:
-            api_key = os.getenv('ASANA_API_KEY')
-            if not api_key:
-                self.console.print("[red]Error: ASANA_API_KEY environment variable not set or no API key provided[/red]")
-                self.console.print("Please set your Asana API key as an environment variable:")
-                self.console.print("  Windows: set ASANA_API_KEY=your_api_key_here")
-                self.console.print("  Linux/Mac: export ASANA_API_KEY=your_api_key_here")
-                sys.exit(1)
+            api_key = self._get_api_key()
         
         # Initialize Asana client
         try:
@@ -45,6 +41,39 @@ class AsanaProgressTracker:
         except Exception as e:
             self.console.print(f"[red]Error connecting to Asana API: {e}[/red]")
             sys.exit(1)
+    
+    def _get_api_key(self) -> str:
+        """
+        Get API key from keychain or prompt user to enter it.
+        
+        Returns:
+            str: The API key
+        """
+        # Try to get from keychain first
+        stored_key = keyring.get_password("asana_cli", "api_key")
+        if stored_key:
+            self.console.print("[green]✓ Retrieved API key from keychain[/green]")
+            return stored_key
+        
+        # If not in keychain, prompt user
+        self.console.print("[yellow]API key not found in keychain. Please enter your Asana API key:[/yellow]")
+        self.console.print("You can get your API key from: https://app.asana.com/0/my-apps")
+        
+        api_key = getpass.getpass("Asana API Key: ")
+        
+        if not api_key.strip():
+            self.console.print("[red]Error: API key cannot be empty[/red]")
+            sys.exit(1)
+        
+        # Store in keychain for future use
+        try:
+            keyring.set_password("asana_cli", "api_key", api_key)
+            self.console.print("[green]✓ API key stored in keychain for future use[/green]")
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Could not store API key in keychain: {e}[/yellow]")
+            self.console.print("[yellow]You'll need to enter the API key again next time[/yellow]")
+        
+        return api_key
     
     def get_all_projects(self) -> List[Dict[str, Any]]:
         """
@@ -64,7 +93,7 @@ class AsanaProgressTracker:
                 workspace_name = workspace.get('name', 'Unknown Workspace')
                 self.console.print(f"  [blue]Scanning workspace: {workspace_name}[/blue]")
                 
-                # Get projects in this workspace
+                # Get projects in this workspace with status field
                 projects = self.client.projects.find_all({
                     'workspace': workspace['gid'],
                     'opt_fields': 'name,completed,completed_at,owner,team,notes,color,created_at,due_date,start_on,archived'
@@ -109,6 +138,55 @@ class AsanaProgressTracker:
             # Calculate percentage
             percentage = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
             
+            # Get actual project status from Asana project_statuses endpoint
+            try:
+                statuses = self.client.project_statuses.find_by_project(project_gid, {
+                    'opt_fields': 'text,color,created_at'
+                })
+                # Get the most recent status
+                if statuses:
+                    latest_status = max(statuses, key=lambda x: x.get('created_at', ''))
+                    color = latest_status.get('color', None)
+                    
+                    if color == 'green':
+                        status_text = 'On track'
+                    elif color == 'blue':
+                        status_text = 'On hold'
+                    elif color == 'yellow':
+                        status_text = 'At risk'
+                    elif color == 'red':
+                        status_text = 'Off track'
+                    elif color == 'complete':
+                        status_text = 'Completed'
+                    elif color is None:
+                        # If no color, try to infer from text
+                        text = latest_status.get('text', '').lower()
+                        if 'hold' in text or 'pause' in text or 'wait' in text:
+                            status_text = 'On hold'
+                        elif 'risk' in text or 'delay' in text or 'issue' in text:
+                            status_text = 'At risk'
+                        elif 'off track' in text or 'problem' in text or 'red' in text:
+                            status_text = 'Off track'
+                        elif 'track' in text or 'progress' in text or 'good' in text:
+                            status_text = 'On track'
+                        elif 'complete' in text or 'done' in text:
+                            status_text = 'Completed'
+                        else:
+                            status_text = 'No status'
+                    else:
+                        # Unknown color value - default to 'on hold' for now
+                        status_text = 'on hold'
+                else:
+                    status_text = 'No status'
+            except Exception as e:
+                # If we can't fetch status, fall back to basic status
+                if project.get('completed', False):
+                    status_text = 'completed'
+                elif project.get('archived', False):
+                    status_text = 'Archived'
+                else:
+                    status_text = 'Active'
+            
             return {
                 'name': project_name,
                 'workspace': project.get('workspace_name', 'Unknown'),
@@ -117,6 +195,7 @@ class AsanaProgressTracker:
                 'percentage': percentage,
                 'completed': project.get('completed', False),
                 'archived': project.get('archived', False),
+                'status': status_text,
                 'color': project.get('color', 'light-blue')
             }
             
@@ -130,12 +209,13 @@ class AsanaProgressTracker:
                 'percentage': 0,
                 'completed': project.get('completed', False),
                 'archived': project.get('archived', False),
+                'status': 'Error',
                 'color': 'red'
             }
     
     def display_progress_bars(self, projects: List[Dict[str, Any]]):
         """
-        Display progress bars for all projects in a nice console format.
+        Display progress bars for all projects in separate tables by workspace.
         
         Args:
             projects: List of project progress dictionaries
@@ -144,13 +224,35 @@ class AsanaProgressTracker:
             self.console.print("[yellow]No projects found to display.[/yellow]")
             return
         
-        # Create a table to display all projects
-        table = Table(title="Asana Projects Progress", show_header=True, header_style="bold magenta")
-        table.add_column("Project Name", style="cyan", width=30)
-        table.add_column("Workspace", style="blue", width=20)
+        # Group projects by workspace
+        workspaces = {}
+        for project in projects:
+            workspace_name = project['workspace']
+            if workspace_name not in workspaces:
+                workspaces[workspace_name] = []
+            workspaces[workspace_name].append(project)
+        
+        # Display separate table for each workspace
+        for workspace_name, workspace_projects in workspaces.items():
+            self._display_workspace_table(workspace_name, workspace_projects)
+        
+        # Display summary statistics
+        self._display_summary(projects)
+    
+    def _display_workspace_table(self, workspace_name: str, projects: List[Dict[str, Any]]):
+        """
+        Display a table for projects in a specific workspace.
+        
+        Args:
+            workspace_name: Name of the workspace
+            projects: List of project progress dictionaries for this workspace
+        """
+        # Create a table for this workspace
+        table = Table(title=f"Workspace: {workspace_name}", show_header=True, header_style="bold magenta")
+        table.add_column("Project Name", style="cyan", width=35)
         table.add_column("Progress", style="green", width=40)
         table.add_column("Tasks", style="yellow", width=15)
-        table.add_column("Status", style="white", width=10)
+        table.add_column("Status", style="white", width=15)
         
         # Sort projects by percentage (descending)
         sorted_projects = sorted(projects, key=lambda x: x['percentage'], reverse=True)
@@ -159,32 +261,47 @@ class AsanaProgressTracker:
             # Create progress bar
             progress_bar = self._create_progress_bar(project['percentage'])
             
-            # Determine status
-            if project['completed']:
-                status = "✅ Done"
-                status_style = "green"
-            elif project['archived']:
-                status = "📦 Archived"
-                status_style = "dim"
-            else:
-                status = "🔄 Active"
-                status_style = "yellow"
+            # Get status with appropriate styling
+            status_text = project['status']
+            status_style = self._get_status_style(status_text)
             
             # Add row to table
             table.add_row(
-                project['name'][:28] + "..." if len(project['name']) > 30 else project['name'],
-                project['workspace'][:18] + "..." if len(project['workspace']) > 20 else project['workspace'],
+                project['name'][:33] + "..." if len(project['name']) > 35 else project['name'],
                 progress_bar,
                 f"{project['completed_tasks']}/{project['total_tasks']}",
-                Text(status, style=status_style)
+                Text(status_text, style=status_style)
             )
         
         # Display the table
         self.console.print()
         self.console.print(table)
+    
+    def _get_status_style(self, status: str) -> str:
+        """
+        Get appropriate styling for project status.
         
-        # Display summary statistics
-        self._display_summary(projects)
+        Args:
+            status: Project status text
+            
+        Returns:
+            str: Rich text style
+        """
+        status_lower = status.lower()
+        if status_lower == 'on track':
+            return "green"
+        elif status_lower == 'on hold':
+            return "blue"
+        elif status_lower == 'at risk':
+            return "yellow"
+        elif status_lower == 'off track':
+            return "red"
+        elif status_lower == 'completed':
+            return "bold green"
+        elif 'archived' in status_lower:
+            return "dim"
+        else:
+            return "white"
     
     def _create_progress_bar(self, percentage: float) -> str:
         """
@@ -218,7 +335,7 @@ class AsanaProgressTracker:
         overall_percentage = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
         
         summary_text = f"""
-        📊 Summary:
+        Summary:
         • Total Projects: {total_projects}
         • Active Projects: {active_projects}
         • Completed Projects: {completed_projects}
@@ -277,14 +394,8 @@ def main():
     console.print("[bold blue]Asana Project Progress Tracker[/bold blue]")
     console.print("This tool will display progress bars for all your Asana projects.\n")
     
-    # Check if API key is provided as command line argument
-    api_key = None
-    if len(sys.argv) > 1:
-        api_key = sys.argv[1]
-        console.print("[green]Using API key from command line argument[/green]")
-    
-    # Create and run the tracker
-    tracker = AsanaProgressTracker(api_key)
+    # Create and run the tracker (API key will be retrieved from keychain or prompted)
+    tracker = AsanaProgressTracker()
     tracker.run()
 
 
