@@ -1,4 +1,4 @@
-# Asana Project Progress Tracker
+# Asana Project Progress Tracker - CLI Version
 
 A Python script that displays progress bars for all your Asana projects in the console, showing completion percentage based on completed vs total tasks.
 
